@@ -1,0 +1,118 @@
+## template: jinja
+#cloud-config
+package_update: true
+package_upgrade: true
+package_reboot_if_required: false
+
+disable_root: false
+
+hostname: proxmox
+fqdn: proxmox.local
+
+# We don't want the default "admin" Debian user:
+users: []
+
+packages:
+ - dnsmasq
+ - patch
+
+write_files:
+  - path: /run/scheduler.patch
+    owner: root:root
+    permissions: '0644'
+    content: |
+      --- ifupdown2/ifupdown/scheduler-old.py	2022-10-07 16:34:42.000000000 +1300
+      +++ ifupdown2/ifupdown/scheduler.py	2022-10-07 16:34:44.000000000 +1300
+      @@ -127,15 +127,19 @@
+      
+               if ifupdownobj.config.get('addon_scripts_support', '0') == '1':
+                   # execute /etc/network/ scripts
+      -            os.environ['IFACE'] = ifaceobj.name if ifaceobj.name else ''
+      -            os.environ['LOGICAL'] = ifaceobj.name if ifaceobj.name else ''
+      -            os.environ['METHOD'] = ifaceobj.addr_method if ifaceobj.addr_method else ''
+      -            os.environ['ADDRFAM'] = ','.join(ifaceobj.addr_family) if ifaceobj.addr_family else ''
+      +            command_env = (cenv or {}).copy()
+      +            command_env.update({
+      +                'IFACE': ifaceobj.name if ifaceobj.name else '',
+      +                'LOGICAL': ifaceobj.name if ifaceobj.name else '',
+      +                'METHOD': ifaceobj.addr_method if ifaceobj.addr_method else '',
+      +                'ADDRFAM': ','.join(ifaceobj.addr_family) if ifaceobj.addr_family else '',
+      +            })
+      +
+                   for mname in ifupdownobj.script_ops.get(op, []):
+                       ifupdownobj.logger.debug('%s: %s : running script %s'
+                           %(ifacename, op, mname))
+                       try:
+      -                    utils.exec_command(mname, env=cenv)
+      +                    utils.exec_command(mname, env=command_env)
+                       except Exception as e:
+                           if "permission denied" in str(e).lower():
+                               ifupdownobj.logger.warning('%s: %s %s' % (ifacename, op, str(e)))
+
+  # DHCP server for vmbr0:
+  - path: /etc/dnsmasq.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      interface=vmbr0
+      dhcp-range=10.10.10.2,10.10.10.254,12h
+      dhcp-option=vmbr0,3,10.10.10.1
+
+# Run every boot:
+bootcmd:
+  # Replace default 127.0.1.1 IP in /etc/hosts with private IP address
+  - sed -i'' 's/^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+\([[:space:]]*[{]{fqdn}}\)/{{ ds.meta_data.local_ipv4 }}\1/' /etc/cloud/templates/hosts.debian.tmpl
+  # Disable IPv6 so we don't hang forever waiting for DHCPv6
+  - sed -i'' -e 's/^\([^#].*inet6.*\)/#\1/' -e 's/^\([^#].*try_dhcp 1.*\)/#\1/' /var/run/network/interfaces.d/* /etc/network/cloud-interfaces-template
+
+# Run only on first boot:
+runcmd:
+  - export DEBIAN_FRONTEND=noninteractive
+  - echo "deb [arch=amd64] http://download.proxmox.com/debian/pve bullseye pve-no-subscription" > /etc/apt/sources.list.d/pve-install-repo.list
+  - wget https://enterprise.proxmox.com/debian/proxmox-release-bullseye.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-bullseye.gpg
+  - apt update && apt full-upgrade -y
+  - echo "postfix postfix/main_mailer_type string 'Internet Site'" | debconf-set-selections
+  # Keep old config files to prevent grub config being changed (otherwise will break EC2 serial console):
+  - apt install proxmox-ve postfix open-iscsi -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -y
+  # Patch ifupdown2 to fix its support for passing env variables to hookscripts
+  - patch /usr/share/ifupdown2/ifupdown/scheduler.py /run/scheduler.patch && rm /run/scheduler.patch
+  # ifupdown2 passes "ADDRFAM=inet,inet6" to the pre-/post-hooks, which are only expecting to see "inet6" or "inet", patch those to add support:
+  - sed -i'' -e 's/ inet6 / inet,inet6 /' /etc/network/if-pre-up.d/cloud_inet6 /etc/network/if-post-down.d/cloud_inet6
+  # Proxmox's ifupdown2 doesn't support source-directory, so use source instead, and add vmbr0 for guest NAT:
+  - export LOCAL_NET_INTERFACE=$(ip -o link show | grep $(cloud-init query ds.meta_data.mac) | awk '{print $2}' | sed 's/:$//')
+  - |
+    echo "
+    # Include files from /etc/network/interfaces.d:
+    source /etc/network/interfaces.d/*
+    
+    # Cloud images dynamically generate config fragments for newly
+    # attached interfaces. See /etc/udev/rules.d/75-cloud-ifupdown.rules
+    # and /etc/network/cloud-ifupdown-helper. Dynamically generated
+    # configuration fragments are stored in /run:
+    source /run/network/interfaces.d/*
+    
+    auto vmbr0
+    iface vmbr0 inet static
+    # NAT network for guests
+        address  10.10.10.1/24
+        bridge-ports none
+        bridge-stp off
+        bridge-fd 0
+    
+        post-up   echo 1 > /proc/sys/net/ipv4/ip_forward
+        post-up   iptables -t nat -A POSTROUTING -s '10.10.10.0/24' -o ${LOCAL_NET_INTERFACE} -j MASQUERADE
+        post-down iptables -t nat -D POSTROUTING -s '10.10.10.0/24' -o ${LOCAL_NET_INTERFACE} -j MASQUERADE
+    
+    # auto vmbr1
+    # iface vmbr1 inet static
+    # # Routed network for guests with manually-allocated secondary private ENI IPs
+    #     address 172.x.x.x/29
+    #     bridge-ports none
+    #     bridge-stp off
+    #     bridge-fd 0
+    #     
+    #     post-up echo 1 > /proc/sys/net/ipv4/ip_forward
+    #     post-up echo 1 > /proc/sys/net/ipv4/conf/${LOCAL_NET_INTERFACE}/proxy_arp
+    " > /etc/network/interfaces
+  - rm -f /etc/network/interfaces.new
+  - systemctl restart networking.service

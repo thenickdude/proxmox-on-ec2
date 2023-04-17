@@ -21,33 +21,24 @@ write_files:
     owner: root:root
     permissions: '0644'
     content: |
-      --- ifupdown2/ifupdown/scheduler-old.py	2022-10-07 16:34:42.000000000 +1300
-      +++ ifupdown2/ifupdown/scheduler.py	2022-10-07 16:34:44.000000000 +1300
-      @@ -127,15 +127,19 @@
-      
-               if ifupdownobj.config.get('addon_scripts_support', '0') == '1':
-                   # execute /etc/network/ scripts
-      -            os.environ['IFACE'] = ifaceobj.name if ifaceobj.name else ''
-      -            os.environ['LOGICAL'] = ifaceobj.name if ifaceobj.name else ''
-      -            os.environ['METHOD'] = ifaceobj.addr_method if ifaceobj.addr_method else ''
-      -            os.environ['ADDRFAM'] = ','.join(ifaceobj.addr_family) if ifaceobj.addr_family else ''
-      +            command_env = (cenv or {}).copy()
-      +            command_env.update({
-      +                'IFACE': ifaceobj.name if ifaceobj.name else '',
-      +                'LOGICAL': ifaceobj.name if ifaceobj.name else '',
-      +                'METHOD': ifaceobj.addr_method if ifaceobj.addr_method else '',
-      +                'ADDRFAM': ','.join(ifaceobj.addr_family) if ifaceobj.addr_family else '',
-      +            })
-      +
-                   for mname in ifupdownobj.script_ops.get(op, []):
-                       ifupdownobj.logger.debug('%s: %s : running script %s'
-                           %(ifacename, op, mname))
-                       try:
-      -                    utils.exec_command(mname, env=cenv)
-      +                    utils.exec_command(mname, env=command_env)
-                       except Exception as e:
-                           if "permission denied" in str(e).lower():
-                               ifupdownobj.logger.warning('%s: %s %s' % (ifacename, op, str(e)))
+      if ifupdownobj.config.get('addon_scripts_support', '0') == '1':
+          # execute /etc/network/ scripts
+          command_env = (cenv or {}).copy()
+          command_env.update({
+              'IFACE': ifaceobj.name if ifaceobj.name else '',
+              'LOGICAL': ifaceobj.name if ifaceobj.name else '',
+              'METHOD': ifaceobj.addr_method if ifaceobj.addr_method else '',
+              'ADDRFAM': ','.join(ifaceobj.addr_family) if ifaceobj.addr_family else '',
+          })
+
+      for mname in ifupdownobj.script_ops.get(op, []):
+          ifupdownobj.logger.debug('%s: %s : running script %s'
+              %(ifacename, op, mname))
+          try:
+              utils.exec_command(mname, env=command_env)
+          except Exception as e:
+              if "permission denied" in str(e).lower():
+                  ifupdownobj.logger.warning('%s: %s %s' % (ifacename, op, str(e)))
 
   # DHCP server for vmbr0:
   - path: /etc/dnsmasq.conf
